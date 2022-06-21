@@ -8,48 +8,76 @@ import 'package:at_utils/at_logger.dart';
 ///Listener class for messages received by [RemoteSecondary]
 class OutboundMessageListener {
   final logger = AtSignLogger('OutboundMessageListener');
-  final _buffer = ByteBuffer(capacity: 10240000);
-  late Queue _queue;
+  late ByteBuffer _buffer;
+  final Queue _queue = Queue();
   final _connection;
   Function? syncCallback;
+  final int terminatingChar = 10;
+  final int atCharCodeUnit = 64;
 
-  OutboundMessageListener(this._connection);
+  OutboundMessageListener(this._connection, {int bufferCapacity = 10240000}) {
+    _buffer = ByteBuffer(capacity: bufferCapacity);
+  }
 
   /// Listens to the underlying connection's socket if the connection is created.
   /// @throws [AtConnectException] if the connection is not yet created
   void listen() {
-    _connection.getSocket().listen(_messageHandler,
+    _connection.getSocket().listen(messageHandler,
         onDone: _finishedHandler, onError: _errorHandler);
-    _queue = Queue();
   }
 
   /// Handles messages on the inbound client's connection and calls the verb executor
   /// Closes the inbound connection in case of any error.
   /// Throw a [BufferOverFlowException] if buffer is unable to hold incoming data
-  Future<void> _messageHandler(data) async {
+  Future<void> messageHandler(List data) async {
     String result;
-    if (!_buffer.isOverFlow(data)) {
-      // skip @ prompt
-      if (data.length == 1 && data.first == 64) {
-        return;
+    // check buffer overflow
+    _checkBufferOverFlow(data);
+    //1. Iterate the list until a new line character is encounter.
+    //2. If new line char is encountered, then decode the buffered data (utf8.decode)
+    //3. Strip the prompt from the result.
+    //4. Add the result to queue.
+    for (var element in data) {
+      // If element is @ character and lastCharacter in the buffer is \n,
+      // then complete data is received. process it.
+      if (element == atCharCodeUnit &&
+          _buffer.getData().last == terminatingChar) {
+        result = utf8.decode(_buffer.getData());
+        result = _stripPrompt(result);
+        _queue.add(result);
+        //clear the buffer after adding result to queue
+        _buffer.clear();
+      } else {
+        _buffer.addByte(element);
       }
-      //ignore prompt(@ or @<atSign>@) after '\n'
-      // If data contains 10(utf8 character for '\n'), trim the string after the '\n'
-      if (data.contains(10)) {
-        data = data.sublist(0, data.lastIndexOf(10) + 1);
-      }
-      _buffer.append(data);
-    } else {
+    }
+  }
+
+  /// The methods verifies if buffer has the capacity to accept the data.
+  ///
+  /// Throw BufferOverFlowException if data length exceeds the buffer capacity
+  _checkBufferOverFlow(data) {
+    if (_buffer.isOverFlow(data)) {
+      int bufferLength = (_buffer.length() + data.length) as int;
       _buffer.clear();
       throw BufferOverFlowException(
-          'Buffer overflow on outbound connection result');
+          'data length exceeded the buffer limit. Data length : $bufferLength and Buffer capacity ${_buffer.capacity}');
     }
-    if (_buffer.isEnd()) {
-      result = utf8.decode(_buffer.getData());
-      result = result.trim();
-      _buffer.clear();
-      _queue.add(result);
+  }
+
+  /// The method accepts the result (server response) and trim's the prompt from the response
+  /// and returns the actual response.
+  String _stripPrompt(String result) {
+    // trim the \n character in the last.
+    result = result.trim();
+    var colonIndex = result.indexOf(':');
+    var responsePrefix = result.substring(0, colonIndex);
+    var response = result.substring(colonIndex);
+    if (responsePrefix.contains('@')) {
+      responsePrefix =
+          responsePrefix.substring(responsePrefix.lastIndexOf('@') + 1);
     }
+    return '$responsePrefix$response';
   }
 
   /// Reads the response sent by remote socket from the queue.
